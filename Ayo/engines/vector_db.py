@@ -5,10 +5,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import asyncpg
+import faiss
 import numpy as np
 import ray
-from pgvector.asyncpg import register_vector
 
 from Ayo.logger import GLOBAL_INFO_LEVEL, get_logger
 
@@ -43,31 +42,18 @@ class VectorDBEngine:
     Features:
     - Async request handling
     - Batched insertions
-    - Per-query table management
+    - Per-query in-memory FAISS indices
     - Concurrent read/write operations
     """
 
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 5432,
-        user: str = "asplos25",
-        password: str = "123456",
-        database: str = "database_asplos",
         max_batch_size: int = 1000,
         max_queue_size: int = 2000,
         vector_dim: int = 768,
         scheduler_ref: Optional[ray.actor.ActorHandle] = None,
         **kwargs,
     ):
-
-        self.db_config = {
-            "host": host,
-            "port": port,
-            "user": user,
-            "password": password,
-            "database": database,
-        }
         self.max_batch_size = max_batch_size
         self.max_queue_size = max_queue_size
         self.vector_dim = vector_dim
@@ -78,17 +64,18 @@ class VectorDBEngine:
         self.insert_queue = asyncio.Queue(maxsize=max_queue_size)
         self.search_queue = asyncio.Queue(maxsize=max_queue_size)
 
-        # Track active tables and requests
-        self.active_tables: Dict[str, str] = {}  # query_id -> table_name
+        # Track active indices and requests
+        self.active_indices: Dict[str, str] = {}  # query_id -> index_name
+        self.index_store: Dict[str, Dict[str, Any]] = {}  # query_id -> {index, texts}
         self.query_requests: Dict[str, List[VectorDBRequest]] = {}
-
-        # Create event loop and connection pool
-        self.pool = None
 
         # Start processing tasks
         self.running = True
         self.tasks = []
-        asyncio.create_task(self._initialize())
+        self.tasks = [
+            asyncio.create_task(self._process_inserts()),
+            asyncio.create_task(self._process_searches()),
+        ]
 
         self.scheduler_ref = scheduler_ref
 
@@ -96,53 +83,23 @@ class VectorDBEngine:
         """Check if the engine is ready"""
         return True
 
-    async def _initialize(self):
-        """Initialize database connection and start processing tasks"""
-        # Create connection pool
-        self.pool = await asyncpg.create_pool(**self.db_config)
-
-        # Register vector type with asyncpg
-        async with self.pool.acquire() as conn:
-            await register_vector(conn)
-
-        # Start processing tasks
-        self.tasks = [
-            asyncio.create_task(self._process_inserts()),
-            asyncio.create_task(self._process_searches()),
-        ]
-
-    def _get_table_name(self, query_id: str) -> str:
-        """Generate unique table name for query_id"""
+    def _get_index_name(self, query_id: str) -> str:
+        """Generate unique index name for a query_id"""
         hash_obj = hashlib.md5(query_id.encode())
         return f"vectors_{hash_obj.hexdigest()}"
 
-    async def _ensure_table(self, query_id: str) -> str:
-        """Ensure table exists for query_id"""
-        if query_id not in self.active_tables:
-            logger.debug(f"ensure table for query_id: {query_id}")
-            table_name = self._get_table_name(query_id)
-            async with self.pool.acquire() as conn:
+    def _get_or_create_index(
+        self, query_id: str
+    ) -> Tuple[faiss.IndexFlatIP, List[str]]:
+        """Create an in-memory FAISS index for the query if absent"""
+        if query_id not in self.index_store:
+            logger.debug(f"ensure index for query_id: {query_id}")
+            index = faiss.IndexFlatIP(self.vector_dim)
+            self.index_store[query_id] = {"index": index, "texts": []}
+            self.active_indices[query_id] = self._get_index_name(query_id)
 
-                await conn.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        id SERIAL PRIMARY KEY,
-                        embedding vector({self.vector_dim}),
-                        text TEXT
-                    )
-                """
-                )
-
-                # Use simple vector index - use HNSW index, better for small dataset and no pre-training
-                await conn.execute(
-                    f"""
-                    CREATE INDEX IF NOT EXISTS {table_name}_embedding_idx
-                    ON {table_name}
-                    USING hnsw (embedding vector_cosine_ops)
-                """
-                )
-            self.active_tables[query_id] = table_name
-        return self.active_tables[query_id]
+        store = self.index_store[query_id]
+        return store["index"], store["texts"]
 
     async def ingest(
         self,
@@ -273,12 +230,9 @@ class VectorDBEngine:
 
                 # Process each query group
                 for query_id, indices in query_groups.items():
-                    table_name = await self._ensure_table(query_id)
-                    logger.debug(f"ingest in vector_db: {query_id} {table_name}")
-
-                    # each item in batch_data is a list of (embedding, text) pairs
-                    # data = [(embedding, text) for embedding, text in zip(embeddings, texts)]
-                    # merge all items in batch_data into a single list of (embedding, text) pairs
+                    index, texts = self._get_or_create_index(query_id)
+                    index_name = self.active_indices[query_id]
+                    logger.debug(f"ingest in vector_db: {query_id} {index_name}")
 
                     group_data = []
                     for i in indices:
@@ -287,35 +241,36 @@ class VectorDBEngine:
 
                     logger.debug(f"len of group_data: {len(group_data)}")
 
-                    # Insert vectors in batch
+                    embeddings_to_add: List[np.ndarray] = []
+                    texts_to_add: List[str] = []
+
+                    for embedding, text in group_data:
+                        arr = np.asarray(embedding, dtype=np.float32)
+                        if arr.ndim > 1:
+                            arr = arr.reshape(-1)
+                        if arr.shape[0] != self.vector_dim:
+                            raise ValueError(
+                                f"Embedding dimension {arr.shape[0]} does not match expected {self.vector_dim}"
+                            )
+                        embeddings_to_add.append(arr)
+                        texts_to_add.append(text)
+
+                    if not embeddings_to_add:
+                        continue
+
+                    vectors = np.stack(embeddings_to_add)
+                    faiss.normalize_L2(vectors)
+
                     begin = time.time()
-                    async with self.pool.acquire() as conn:
+                    index.add(vectors)
+                    texts.extend(texts_to_add)
+                    end = time.time()
 
-                        if isinstance(group_data[0][0], list):
+                    logger.debug(f"insert time: {end - begin}")
+                    logger.debug(
+                        f"Index {index_name} contains {index.ntotal} records after ingest"
+                    )
 
-                            await conn.executemany(
-                                f"INSERT INTO {table_name} (embedding, text) VALUES ($1, $2)",
-                                [(embedding, text) for embedding, text in group_data],
-                            )
-                        else:
-
-                            await conn.executemany(
-                                f"INSERT INTO {table_name} (embedding, text) VALUES ($1, $2)",
-                                [
-                                    (embedding.tolist(), text)
-                                    for embedding, text in group_data
-                                ],
-                            )
-
-                        end = time.time()
-                        logger.debug(f"insert time: {end - begin}")
-
-                        count = await conn.fetchval(
-                            f"SELECT COUNT(*) FROM {table_name}"
-                        )
-                        logger.debug(
-                            f"Table {table_name} contains {count} records after ingest"
-                        )
                     # Update results and clean up
                     for i in indices:
                         request = batch_requests[i]
@@ -349,72 +304,76 @@ class VectorDBEngine:
                     continue
 
                 query_vectors, top_k = request.data
-                table_name = await self._ensure_table(request.query_id)
+                index_entry = self.index_store.get(request.query_id)
+
+                if index_entry is None or index_entry["index"].ntotal == 0:
+                    logger.debug(
+                        f"search in vector_db: {request.request_id} {request.query_id} has no index"
+                    )
+                    result_ref = ray.put([])
+                    if self.scheduler_ref is not None:
+                        await self.scheduler_ref.on_result.remote(
+                            request.request_id, request.query_id, result_ref
+                        )
+                    if request.query_id in self.query_requests:
+                        self.query_requests[request.query_id].remove(request)
+                    continue
+
+                index = index_entry["index"]
+                texts = index_entry["texts"]
+                index_name = self.active_indices.get(request.query_id, "")
 
                 logger.debug(
-                    f"search in vector_db: {request.request_id} {request.query_id} {table_name}"
+                    f"search in vector_db: {request.request_id} {request.query_id} {index_name}"
                 )
 
-                # Execute vector search
-                async with self.pool.acquire() as conn:
-                    count = await conn.fetchval(f"SELECT COUNT(*) FROM {table_name}")
-                    logger.debug(f"Table {table_name} contains {count} records")
-
-                    # Process multiple query vectors
-                    all_results = []
-                    begin = time.time()
-
-                    for query_vector in query_vectors:
-                        # Ensure query vector format is correct
-                        if isinstance(query_vector, list):
-                            query_vector = np.array(query_vector)
-
-                        if len(query_vector.shape) > 1:
-                            query_vector = query_vector.flatten()
-
-                        # Execute single vector query
-                        vector_results = await conn.fetch(
-                            f"""
-                            SELECT text, embedding <=> $1 as distance
-                            FROM {table_name}
-                            ORDER BY embedding <=> $1
-                            LIMIT $2
-                            """,
-                            query_vector.tolist(),
-                            top_k,
+                # Normalize and batch query vectors
+                if isinstance(query_vectors, np.ndarray):
+                    if query_vectors.ndim == 1:
+                        query_vectors = query_vectors[None, :]
+                    elif query_vectors.ndim > 2:
+                        query_vectors = query_vectors.reshape(
+                            query_vectors.shape[0], -1
                         )
+                elif not isinstance(query_vectors, list):
+                    query_vectors = [query_vectors]
 
-                        # Format single query result
-                        search_results = [
-                            {
-                                "text": record["text"],
-                                "score": 1
-                                - float(
-                                    record["distance"]
-                                ),  # Convert distance to similarity score
-                            }
-                            for record in vector_results
-                        ]
-                        all_results.append(search_results)
+                query_matrix = np.asarray(query_vectors, dtype=np.float32)
+                if query_matrix.ndim == 1:
+                    query_matrix = query_matrix[None, :]
 
-                    end = time.time()
-                    logger.debug(
-                        f"search time for {len(query_vectors)} vectors: {end - begin}"
+                if query_matrix.shape[1] != self.vector_dim:
+                    raise ValueError(
+                        f"Query vector dimension {query_matrix.shape[1]} does not match expected {self.vector_dim}"
                     )
+
+                faiss.normalize_L2(query_matrix)
+
+                begin = time.time()
+                distances, indices = index.search(
+                    query_matrix, min(top_k, index.ntotal)
+                )
+                end = time.time()
+                logger.debug(
+                    f"search time for {len(query_matrix)} vectors: {end - begin}"
+                )
+
+                all_results: List[List[Dict[str, Union[str, float]]]] = []
+                for dist_row, idx_row in zip(distances, indices):
+                    search_results: List[Dict[str, Union[str, float]]] = []
+                    for score, idx in zip(dist_row, idx_row):
+                        if idx == -1:
+                            continue
+                        search_results.append(
+                            {"text": texts[idx], "score": float(score)}
+                        )
+                    all_results.append(search_results)
 
                 # If there is only one query vector, return a single result list instead of a nested list
                 if len(all_results) == 1:
-                    search_results = all_results[0]
-                    # sort and take top_k
-                    search_results = sorted(
-                        search_results, key=lambda x: x["score"], reverse=True
-                    )[:top_k]
+                    search_results = all_results[0][:top_k]
                 else:
-                    search_results = all_results
-                    for i, result in enumerate(search_results):
-                        search_results[i] = sorted(
-                            result, key=lambda x: x["score"], reverse=True
-                        )[:top_k]
+                    search_results = [results[:top_k] for results in all_results]
 
                 logger.debug(f"search results: {search_results}")
 
@@ -438,11 +397,10 @@ class VectorDBEngine:
 
     async def cleanup_query(self, query_id: str):
         """Clean up resources for a query"""
-        if query_id in self.active_tables:
-            table_name = self.active_tables[query_id]
-            async with self.pool.acquire() as conn:
-                await conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-            del self.active_tables[query_id]
+        if query_id in self.index_store:
+            del self.index_store[query_id]
+        if query_id in self.active_indices:
+            del self.active_indices[query_id]
 
     async def shutdown(self):
         """Shutdown the service"""
@@ -458,12 +416,8 @@ class VectorDBEngine:
 
         # Clean up all tables created by queries
         try:
-            for query_id in list(self.active_tables.keys()):
+            for query_id in list(self.active_indices.keys()):
                 await self.cleanup_query(query_id)
-            print("Successfully cleaned up all tables")
+            print("Successfully cleaned up all indices")
         except Exception as e:
-            print(f"Error cleaning up tables: {e}")
-
-        # Close database pool
-        if self.pool:
-            await self.pool.close()
+            print(f"Error cleaning up indices: {e}")

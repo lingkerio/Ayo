@@ -23,14 +23,16 @@ Unlike existing frameworks that usually treat workflows as coarse-grained, seque
 
 1. Install dependencies:
 
-Install postgres and pgvector:
+Install FAISS (CPU build by default):
 ```bash
-sudo apt-get install postgresql postgresql-contrib libpq-dev # install postgresql
-git clone https://github.com/pgvector/pgvector.git # compile and install pgvector; you could install through other ways as well
-cd pgvector
-make
-sudo make install
-sudo -u postgres psql template1 -c "CREATE EXTENSION vector;" # test
+pip install faiss-cpu==1.9.0
+# or install a GPU-enabled build if available for your platform
+```
+
+```
+export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
 Install our modified vllm:
@@ -254,8 +256,7 @@ We list open-source projects used by us and our modifications to them (if any).
 
 - [vLLM](https://github.com/vllm-project/vllm)
 - [Ray](https://github.com/ray-project/ray)
-- [postgresql](https://www.postgresql.org/)
-- [pgvector](https://github.com/pgvector/pgvector)
+- [FAISS](https://github.com/facebookresearch/faiss)
 - [sentence-transformers](https://github.com/UKPLab/sentence-transformers)
 
 

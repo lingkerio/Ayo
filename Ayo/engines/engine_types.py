@@ -90,14 +90,11 @@ class EngineRegistry:
             EngineSpec(
                 engine_class=VectorDBEngine,
                 default_config={
-                    "host": "localhost",
-                    "user": "asplos25",
-                    "password": "123456",
-                    "database": "database_asplos",
-                    "port": 5432,
                     "max_batch_size": 1000,
+                    "max_queue_size": 2000,
+                    "vector_dim": 768,
                 },
-                description="Vector database engine using pgvector",
+                description="In-memory vector database engine backed by FAISS",
             ),
         )
 
@@ -118,7 +115,8 @@ class EngineRegistry:
             EngineSpec(
                 engine_class=LLMEngine,
                 default_config={
-                    "model_name": "meta-llama/Llama-2-7b-chat-hf",
+                    # Open-access default to avoid gated repos
+                    "model_name": "Qwen/Qwen2.5-7B-Instruct",
                     "tensor_parallel_size": 1,
                     "max_num_seqs": 256,
                     "max_queue_size": 1000,
