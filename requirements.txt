@@ -4,7 +4,7 @@ google_api_python_client==2.125.0
 llama_index==0.12.19
 numpy==1.24.3
 pandas==1.1.5
-faiss-cpu=1.8.0
+faiss-cpu==1.8.0
 pydantic>=2.8.0
 ray==2.10.0
 Requests==2.32.3
