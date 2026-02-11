@@ -1,4 +1,4 @@
 [submodule "vllm"]
 	path = vllm-src
-	url = https://github.com/Txxx926/vllm
+	url = https://github.com/lingkerio/vllm-ayo
 	branch = ayo
