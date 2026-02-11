@@ -38,7 +38,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 **Clone the repo:**
 ```bash
-git clone --recurse-submodules https://github.com/NetX-lab/Ayo.git
+git clone --recurse-submodules https://github.com/lingkerio/Ayo.git
 cd Ayo
 ```
 
