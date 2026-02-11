@@ -23,30 +23,53 @@ Unlike existing frameworks that usually treat workflows as coarse-grained, seque
 
 1. Install dependencies:
 
-Install FAISS (CPU build by default):
+**Create a conda environment (Python 3.9 required):**
 ```bash
-pip install faiss-cpu==1.9.0
-# or install a GPU-enabled build if available for your platform
+conda create -n ayo python=3.9
+conda activate ayo
 ```
 
-```
+**Set up CUDA environment (CUDA 12.4):**
+```bash
 export CUDA_HOME=/usr/local/cuda-12.4
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
-Install our modified vllm:
+**Clone the repo:**
 ```bash
-git clone --recurse-submodules https://github.com/NetX-lab/Ayo.git # clone the repo and submodules
-cd vllm
+git clone --recurse-submodules https://github.com/NetX-lab/Ayo.git
+cd Ayo
+```
+
+**Install PyTorch (CUDA 12.4):**
+```bash
+pip install torch==2.4.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+```
+
+**Install our modified vllm:**
+```bash
+cd vllm-src
+pip install -e . --no-build-isolation --no-deps
+cd ..
+```
+
+> Note: `--no-build-isolation` is needed because vllm's `setup.py` imports `torch` at build time. `--no-deps` prevents vllm from overriding the pinned package versions.
+
+**Install Ayo:**
+```bash
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 pip install -e .
 ```
 
-Install Ayo:
+> Note: `--extra-index-url` is required because `torch==2.4.0+cu124` is hosted on the PyTorch wheel index, not PyPI.
+
+**Verify the installation:**
+
+Run the DAG unit tests and a module-to-primitives example (no GPU or database required):
 ```bash
-cd ..
-pip install -r requirements.txt
-pip install -e .
+python -m pytest examples/test_dag.py -v
+python examples/modules_to_primitives_indexing_searching.py
 ```
 
 2. Define the workflow with Nodes (Task Primitives) and Optimize the workflow with Ayo

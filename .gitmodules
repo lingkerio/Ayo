@@ -1,4 +1,4 @@
 [submodule "vllm"]
 	path = vllm-src
 	url = https://github.com/lingkerio/vllm-ayo
-	branch = ayo
+	branch = py3.9
