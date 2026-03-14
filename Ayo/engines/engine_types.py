@@ -90,9 +90,11 @@ class EngineRegistry:
             EngineSpec(
                 engine_class=VectorDBEngine,
                 default_config={
+                    "vector_dim": 4096,
                     "max_batch_size": 1000,
                     "max_queue_size": 2000,
-                    "vector_dim": 768,
+                    "normalize_L2": True,
+                    "distance_strategy": "MAX_INNER_PRODUCT",
                 },
                 description="In-memory vector database engine backed by FAISS",
             ),

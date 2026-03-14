@@ -1,13 +1,13 @@
 import asyncio
-import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import faiss
 import numpy as np
 import ray
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_community.vectorstores.faiss import FAISS, dependable_faiss_import
 
 from Ayo.logger import GLOBAL_INFO_LEVEL, get_logger
 
@@ -29,34 +29,56 @@ class VectorDBRequest:
     query_id: str
     request_type: RequestType
     data: Union[
-        List[Tuple[Union[np.ndarray, list], str]], Tuple[Union[np.ndarray, list], int]
-    ]  # (embeddings, texts) for ingestion or (query_vector, top_k) for searching
+        List[Tuple[Union[np.ndarray, list], str]],
+        Tuple[List[Union[np.ndarray, list]], int],
+    ]  # (embeddings, texts) for ingestion or (query_vectors, top_k) for searching
     callback_ref: Any  # Ray ObjectRef for result
-    timestamp: float = time.time()
+    timestamp: float = field(default_factory=time.time)
 
 
 @ray.remote
 class VectorDBEngine:
-    """Ray Actor for serving vector database operations
+    """Ray Actor for serving vector database operations using FAISS
 
     Features:
     - Async request handling
     - Batched insertions
-    - Per-query in-memory FAISS indices
     - Concurrent read/write operations
+    - Global FAISS index
     """
 
     def __init__(
         self,
+        vector_dim: int = 768,
+        index_path: Optional[str] = None,
         max_batch_size: int = 1000,
         max_queue_size: int = 2000,
-        vector_dim: int = 768,
+        normalize_L2: bool = False,
+        distance_strategy: str = "MAX_INNER_PRODUCT",
+        relevance_score_fn: Optional[Callable[[float], float]] = None,
         scheduler_ref: Optional[ray.actor.ActorHandle] = None,
         **kwargs,
     ):
+        """
+        Initialize FAISS-based VectorDBEngine
+
+        Args:
+            vector_dim: Dimension of vectors
+            index_path: Optional path to load existing FAISS index from
+            max_batch_size: Maximum batch size for insertions
+            max_queue_size: Maximum queue size for requests
+            normalize_L2: Whether to normalize vectors
+            distance_strategy: Distance strategy for similarity search
+            relevance_score_fn: Function to convert raw scores to relevance scores
+            scheduler_ref: Reference to scheduler actor
+        """
+        self.vector_dim = vector_dim
         self.max_batch_size = max_batch_size
         self.max_queue_size = max_queue_size
-        self.vector_dim = vector_dim
+        self.index_path = index_path
+        self.normalize_L2 = normalize_L2
+        self.distance_strategy = distance_strategy
+        self.relevance_score_fn = relevance_score_fn
 
         self.name = kwargs.get("name", None)
 
@@ -64,42 +86,126 @@ class VectorDBEngine:
         self.insert_queue = asyncio.Queue(maxsize=max_queue_size)
         self.search_queue = asyncio.Queue(maxsize=max_queue_size)
 
-        # Track active indices and requests
-        self.active_indices: Dict[str, str] = {}  # query_id -> index_name
-        self.index_store: Dict[str, Dict[str, Any]] = {}  # query_id -> {index, texts}
+        # FAISS index and related components
+        self.faiss_index = None
+        self.docstore = None
+        self.index_to_docstore_id = {}
+        self._next_doc_id = 0
+
+        # Track active requests
         self.query_requests: Dict[str, List[VectorDBRequest]] = {}
 
         # Start processing tasks
         self.running = True
         self.tasks = []
-        self.tasks = [
-            asyncio.create_task(self._process_inserts()),
-            asyncio.create_task(self._process_searches()),
-        ]
+        self._initialized = False
+        self._init_error: Optional[Exception] = None
+        self._ready_event = asyncio.Event()
+        self._init_task = asyncio.create_task(self._initialize())
 
         self.scheduler_ref = scheduler_ref
 
-    def is_ready(self):
-        """Check if the engine is ready"""
-        return True
+    async def is_ready(self, timeout_s: float = 120.0):
+        """Block until initialization completes (or fails)."""
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"VectorDBEngine initialization timed out after {timeout_s}s"
+            ) from e
 
-    def _get_index_name(self, query_id: str) -> str:
-        """Generate unique index name for a query_id"""
-        hash_obj = hashlib.md5(query_id.encode())
-        return f"vectors_{hash_obj.hexdigest()}"
+        if self._init_error is not None:
+            raise RuntimeError(
+                f"VectorDBEngine failed to initialize: {self._init_error}"
+            ) from self._init_error
 
-    def _get_or_create_index(
-        self, query_id: str
-    ) -> Tuple[faiss.IndexFlatIP, List[str]]:
-        """Create an in-memory FAISS index for the query if absent"""
-        if query_id not in self.index_store:
-            logger.debug(f"ensure index for query_id: {query_id}")
-            index = faiss.IndexFlatIP(self.vector_dim)
-            self.index_store[query_id] = {"index": index, "texts": []}
-            self.active_indices[query_id] = self._get_index_name(query_id)
+        return self._initialized
 
-        store = self.index_store[query_id]
-        return store["index"], store["texts"]
+    async def _initialize(self):
+        """Initialize FAISS vector store and start processing tasks"""
+        try:
+            # Initialize FAISS vector store
+            if self.index_path:
+                logger.info(f"Loading FAISS index from {self.index_path}")
+                self.vector_store = FAISS.load_local(
+                    self.index_path,
+                    embeddings=None,
+                    allow_dangerous_deserialization=True,
+                    normalize_L2=self.normalize_L2,
+                    distance_strategy=self.distance_strategy,
+                    relevance_score_fn=self.relevance_score_fn,
+                )
+            else:
+                logger.info("Creating new FAISS index")
+                # Create empty FAISS index - will be populated on first insert
+                # We need a dummy text to initialize the index
+
+                faiss = dependable_faiss_import()
+
+                # Create appropriate index type based on distance strategy
+                if self.distance_strategy == "MAX_INNER_PRODUCT":
+                    # Inner product - used for cosine similarity with normalized vectors
+                    index = faiss.IndexFlatIP(self.vector_dim)
+                    logger.info(f"Created FAISS IndexFlatIP with dim={self.vector_dim}")
+                else:
+                    # Default to L2 distance
+                    index = faiss.IndexFlatL2(self.vector_dim)
+                    logger.info(f"Created FAISS IndexFlatL2 with dim={self.vector_dim}")
+
+                docstore = InMemoryDocstore()
+                index_to_docstore_id = {}
+
+                self.vector_store = FAISS(
+                    index=index,
+                    embedding_function=None,
+                    docstore=docstore,
+                    index_to_docstore_id=index_to_docstore_id,
+                    normalize_L2=self.normalize_L2,
+                    distance_strategy=self.distance_strategy,
+                    relevance_score_fn=self.relevance_score_fn,
+                )
+
+            # Start processing tasks
+            self.tasks = [
+                asyncio.create_task(self._process_inserts()),
+                asyncio.create_task(self._process_searches()),
+            ]
+            self._initialized = True
+            logger.info("VectorDBEngine initialized successfully")
+        except Exception as e:
+            self._init_error = e
+            self.running = False
+            logger.error(f"VectorDBEngine initialization failed: {e}")
+            raise
+        finally:
+            self._ready_event.set()
+
+    async def _finish_request(self, request: VectorDBRequest, result: Any) -> None:
+        """Send result to scheduler and release tracking state."""
+        result_ref = ray.put(result)
+        if self.scheduler_ref is not None:
+            await self.scheduler_ref.on_result.remote(
+                request.request_id, request.query_id, result_ref
+            )
+
+        if request.query_id in self.query_requests:
+            try:
+                self.query_requests[request.query_id].remove(request)
+            except ValueError:
+                pass
+            if len(self.query_requests[request.query_id]) == 0:
+                del self.query_requests[request.query_id]
+
+    async def _finish_request_error(
+        self, request: VectorDBRequest, err: Exception, where: str
+    ) -> None:
+        """Propagate engine errors instead of letting requests hang."""
+        message = (
+            f"VectorDBEngine {where} failed for {request.request_id} "
+            f"(query={request.query_id}): {err}"
+        )
+        logger.error(message)
+        await self._finish_request(request, RuntimeError(message))
 
     async def ingest(
         self,
@@ -112,7 +218,7 @@ class VectorDBEngine:
 
         Args:
             request_id: Unique identifier for this request
-            query_id: Query identifier for table management
+            query_id: Query identifier (not used for table management in FAISS)
             embeddings: List of vector embeddings
             texts: List of corresponding texts
 
@@ -131,24 +237,32 @@ class VectorDBEngine:
         )
 
     async def search(
-        self, request_id: str, query_id: str, query_vector: np.ndarray, top_k: int = 5
+        self,
+        request_id: str,
+        query_id: str,
+        query_vectors: List[Union[np.ndarray, list]],
+        top_k: int = 5,
     ) -> ray.ObjectRef:
         """Search for similar vectors in database
 
         Args:
             request_id: Unique identifier for this request
-            query_id: Query identifier for table lookup
-            query_vector: Vector to search for
+            query_id: Query identifier
+            query_vectors: List of vectors to search for (can be single vector in list)
             top_k: Number of results to return
 
         Returns:
             Ray ObjectRef for results
         """
+        # Ensure query_vectors is a list
+        if not isinstance(query_vectors, list):
+            query_vectors = [query_vectors]
+
         return await self.submit_request(
             request_id=request_id,
             query_id=query_id,
             request_type=RequestType.SEARCHING,
-            data=(query_vector, top_k),
+            data=(query_vectors, top_k),
         )
 
     async def submit_request(
@@ -156,7 +270,10 @@ class VectorDBEngine:
         request_id: str,
         query_id: str,
         request_type: RequestType,
-        data: Union[List[Tuple[np.ndarray, str]], Tuple[np.ndarray, int]],
+        data: Union[
+            List[Tuple[Union[np.ndarray, list], str]],
+            Tuple[List[Union[np.ndarray, list]], int],
+        ],
     ) -> None:
         """Submit a new vector database request"""
 
@@ -191,110 +308,79 @@ class VectorDBEngine:
     async def _process_inserts(self):
         """Process insertion requests"""
         while self.running:
+            batch_requests: List[VectorDBRequest] = []
+            unresolved_by_id: Dict[str, VectorDBRequest] = {}
             try:
                 # Collect batch of insertion requests
-                batch_requests = []
-                batch_data = []
-
-                # while len(batch_requests) < self.max_batch_size:
                 while len(batch_requests) == 0:
                     try:
                         request = await asyncio.wait_for(
                             self.insert_queue.get(), timeout=0.1
                         )
                         batch_requests.append(request)
-                        batch_data.append(request.data)
-
+                        unresolved_by_id[request.request_id] = request
                         logger.debug(
                             f"vector_db insert batch_requests len: {len(batch_requests)}"
                         )
-
                     except asyncio.TimeoutError:
                         break
                     except Exception as e:
-                        import traceback
-
-                        traceback.print_exc()
                         logger.error(f"vector_db insert error: {e}")
                         break
 
                 if not batch_requests:
                     continue
 
-                # Group requests by query_id
-                query_groups: Dict[str, List[int]] = {}
-                for i, request in enumerate(batch_requests):
-                    if request.query_id not in query_groups:
-                        query_groups[request.query_id] = []
-                    query_groups[request.query_id].append(i)
+                # Collect all texts and embeddings from batch
+                all_texts = []
+                all_embeddings = []
 
-                # Process each query group
-                for query_id, indices in query_groups.items():
-                    index, texts = self._get_or_create_index(query_id)
-                    index_name = self.active_indices[query_id]
-                    logger.debug(f"ingest in vector_db: {query_id} {index_name}")
+                for request in batch_requests:
+                    for embedding, text in request.data:
+                        # Convert numpy array to list if needed
+                        if isinstance(embedding, np.ndarray):
+                            embedding = embedding.tolist()
 
-                    group_data = []
-                    for i in indices:
-                        request_data = batch_data[i]
-                        group_data.extend(request_data)
+                        all_texts.append(text)
+                        all_embeddings.append(embedding)
 
-                    logger.debug(f"len of group_data: {len(group_data)}")
+                # Batch insert into FAISS
+                begin = time.time()
 
-                    embeddings_to_add: List[np.ndarray] = []
-                    texts_to_add: List[str] = []
+                text_embedding_pairs = list(zip(all_texts, all_embeddings))
+                self.vector_store.add_embeddings(
+                    text_embeddings=text_embedding_pairs,
+                )
 
-                    for embedding, text in group_data:
-                        arr = np.asarray(embedding, dtype=np.float32)
-                        if arr.ndim > 1:
-                            arr = arr.reshape(-1)
-                        if arr.shape[0] != self.vector_dim:
-                            raise ValueError(
-                                f"Embedding dimension {arr.shape[0]} does not match expected {self.vector_dim}"
-                            )
-                        embeddings_to_add.append(arr)
-                        texts_to_add.append(text)
+                end = time.time()
+                logger.debug(
+                    f"FAISS insert time for {len(all_texts)} vectors: {end - begin}"
+                )
 
-                    if not embeddings_to_add:
-                        continue
-
-                    vectors = np.stack(embeddings_to_add)
-                    faiss.normalize_L2(vectors)
-
-                    begin = time.time()
-                    index.add(vectors)
-                    texts.extend(texts_to_add)
-                    end = time.time()
-
-                    logger.debug(f"insert time: {end - begin}")
-                    logger.debug(
-                        f"Index {index_name} contains {index.ntotal} records after ingest"
-                    )
-
-                    # Update results and clean up
-                    for i in indices:
-                        request = batch_requests[i]
-                        result_ref = ray.put(True)
-
-                        if self.scheduler_ref is not None:
-                            await self.scheduler_ref.on_result.remote(
-                                request.request_id, request.query_id, result_ref
-                            )
-
-                        if request.query_id in self.query_requests:
-                            self.query_requests[request.query_id].remove(request)
+                # Update results and clean up
+                for request in batch_requests:
+                    await self._finish_request(request, True)
+                    unresolved_by_id.pop(request.request_id, None)
 
             except Exception as e:
-                # traceback
                 import traceback
 
                 traceback.print_exc()
                 logger.error(f"Error in insert processing: {e}")
+                for request in list(unresolved_by_id.values()):
+                    try:
+                        await self._finish_request_error(request, e, "ingestion")
+                    except Exception as callback_err:
+                        logger.error(
+                            f"Failed to propagate ingestion error for "
+                            f"{request.request_id}: {callback_err}"
+                        )
                 continue
 
     async def _process_searches(self):
         """Process search requests"""
         while self.running:
+            request: Optional[VectorDBRequest] = None
             try:
                 try:
                     request = await asyncio.wait_for(
@@ -304,103 +390,77 @@ class VectorDBEngine:
                     continue
 
                 query_vectors, top_k = request.data
-                index_entry = self.index_store.get(request.query_id)
-
-                if index_entry is None or index_entry["index"].ntotal == 0:
-                    logger.debug(
-                        f"search in vector_db: {request.request_id} {request.query_id} has no index"
-                    )
-                    result_ref = ray.put([])
-                    if self.scheduler_ref is not None:
-                        await self.scheduler_ref.on_result.remote(
-                            request.request_id, request.query_id, result_ref
-                        )
-                    if request.query_id in self.query_requests:
-                        self.query_requests[request.query_id].remove(request)
-                    continue
-
-                index = index_entry["index"]
-                texts = index_entry["texts"]
-                index_name = self.active_indices.get(request.query_id, "")
 
                 logger.debug(
-                    f"search in vector_db: {request.request_id} {request.query_id} {index_name}"
+                    f"search in vector_db: {request.request_id} {request.query_id}"
                 )
 
-                # Normalize and batch query vectors
-                if isinstance(query_vectors, np.ndarray):
-                    if query_vectors.ndim == 1:
-                        query_vectors = query_vectors[None, :]
-                    elif query_vectors.ndim > 2:
-                        query_vectors = query_vectors.reshape(
-                            query_vectors.shape[0], -1
-                        )
-                elif not isinstance(query_vectors, list):
-                    query_vectors = [query_vectors]
-
-                query_matrix = np.asarray(query_vectors, dtype=np.float32)
-                if query_matrix.ndim == 1:
-                    query_matrix = query_matrix[None, :]
-
-                if query_matrix.shape[1] != self.vector_dim:
-                    raise ValueError(
-                        f"Query vector dimension {query_matrix.shape[1]} does not match expected {self.vector_dim}"
-                    )
-
-                faiss.normalize_L2(query_matrix)
-
+                # Execute vector search for each query vector
                 begin = time.time()
-                distances, indices = index.search(
-                    query_matrix, min(top_k, index.ntotal)
-                )
-                end = time.time()
-                logger.debug(
-                    f"search time for {len(query_matrix)} vectors: {end - begin}"
-                )
+                all_results = []
 
-                all_results: List[List[Dict[str, Union[str, float]]]] = []
-                for dist_row, idx_row in zip(distances, indices):
-                    search_results: List[Dict[str, Union[str, float]]] = []
-                    for score, idx in zip(dist_row, idx_row):
-                        if idx == -1:
-                            continue
-                        search_results.append(
-                            {"text": texts[idx], "score": float(score)}
-                        )
+                for query_vector in query_vectors:
+                    # Ensure query vector is in correct format
+                    if isinstance(query_vector, np.ndarray):
+                        query_vector = query_vector.tolist()
+
+                    # Perform similarity search with scores
+                    docs_and_scores = self.vector_store.similarity_search_by_vector(
+                        embedding=query_vector, k=top_k
+                    )
+
+                    # Format results
+                    search_results = [doc.page_content for doc in docs_and_scores]
                     all_results.append(search_results)
 
-                # If there is only one query vector, return a single result list instead of a nested list
-                if len(all_results) == 1:
-                    search_results = all_results[0][:top_k]
-                else:
-                    search_results = [results[:top_k] for results in all_results]
+                end = time.time()
+                logger.debug(
+                    f"search time for {len(query_vectors)} vectors: {end - begin}"
+                )
 
-                logger.debug(f"search results: {search_results}")
+                # If there is only one query vector, return a single result list
+                if len(all_results) == 1:
+                    search_results = all_results[0]
+                else:
+                    search_results = all_results
+
+                logger.debug(f"search results count: {len(search_results)}")
 
                 # Update results and clean up
-                result_ref = ray.put(search_results)
-
-                if self.scheduler_ref is not None:
-                    await self.scheduler_ref.on_result.remote(
-                        request.request_id, request.query_id, result_ref
-                    )
-
-                if request.query_id in self.query_requests:
-                    self.query_requests[request.query_id].remove(request)
+                await self._finish_request(request, search_results)
 
             except Exception as e:
                 import traceback
 
                 traceback.print_exc()
-                print(f"Error in search processing: {e}")
+                logger.error(f"Error in search processing: {e}")
+                if request is not None:
+                    try:
+                        await self._finish_request_error(request, e, "search")
+                    except Exception as callback_err:
+                        logger.error(
+                            f"Failed to propagate search error for "
+                            f"{request.request_id}: {callback_err}"
+                        )
                 continue
 
     async def cleanup_query(self, query_id: str):
-        """Clean up resources for a query"""
-        if query_id in self.index_store:
-            del self.index_store[query_id]
-        if query_id in self.active_indices:
-            del self.active_indices[query_id]
+        """Clean up resources for a query - with FAISS, we don't need to drop tables"""
+        # In FAISS, we can optionally remove documents by query_id
+        if query_id in self.query_requests:
+            del self.query_requests[query_id]
+
+        # Note: FAISS doesn't support easy deletion by metadata filter
+        # If needed, we could implement a cleanup that removes all documents with this query_id
+        logger.debug(f"Cleaned up query_id: {query_id}")
+
+    async def save_index(self, save_path: str):
+        """Save the FAISS index to disk"""
+        if self.vector_store:
+            self.vector_store.save_local(save_path)
+            logger.info(f"Saved FAISS index to {save_path}")
+        else:
+            logger.error("No vector store to save")
 
     async def shutdown(self):
         """Shutdown the service"""
@@ -414,10 +474,4 @@ class VectorDBEngine:
             except asyncio.CancelledError:
                 pass
 
-        # Clean up all tables created by queries
-        try:
-            for query_id in list(self.active_indices.keys()):
-                await self.cleanup_query(query_id)
-            print("Successfully cleaned up all indices")
-        except Exception as e:
-            print(f"Error cleaning up indices: {e}")
+        logger.info("VectorDBEngine shutdown complete")
